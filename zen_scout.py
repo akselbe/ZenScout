@@ -7,8 +7,6 @@ import random
 import io
 import requests
 import numpy as np # Used for exponential backoff calculation
-# Removed Google GenAI import entirely as the functionality is now deprecated/disabled
-# No need to handle the try/except block for genai if we remove the logic.
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 
@@ -93,12 +91,14 @@ if 'request_delay' not in st.session_state:
     st.session_state['request_delay'] = (1.5, 3.0)
 if 'selected_platforms' not in st.session_state:
     st.session_state['selected_platforms'] = list(PLATFORM_ENDPOINTS.keys())
+if 'proxy_url' not in st.session_state:
+    st.session_state['proxy_url'] = ""
 
 # --- AI IS DEACTIVATED ---
 def get_ai_verdict(image_url: str, target_model: str, api_key: str) -> str:
     return "N/A (In Development)"
 
-def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple) -> pd.DataFrame:
+def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple, proxy_url: str) -> pd.DataFrame:
     """Fetches data from a specific ZenMarket platform with pagination and retry logic."""
     
     min_jpy_floor = min_eur_floor * eur_to_jpy_rate
@@ -128,8 +128,22 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
                 delay=random.uniform(delay_range[0], delay_range[1])
             )
             
+            # Configure Proxy if provided
+            if proxy_url:
+                scraper.proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url,
+                }
+
             # Rotate User Agent on retry
-            scraper.headers.update({'User-Agent': USER_AGENTS[attempt % len(USER_AGENTS)]})
+            scraper.headers.update({
+                'User-Agent': USER_AGENTS[attempt % len(USER_AGENTS)],
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://zenmarket.jp/',
+                'Origin': 'https://zenmarket.jp',
+                'Upgrade-Insecure-Requests': '1',
+            })
             
             try:
                 # Add initial request delay
@@ -142,7 +156,7 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
 
             except requests.exceptions.RequestException as e:
                 if attempt == max_retries - 1:
-                    st.warning(f"Failed to fetch {platform_name} (Page {page}) after {max_retries} attempts: {type(e).__name__}.")
+                    st.warning(f"Failed to fetch {platform_name} (Page {page}) after {max_retries} attempts: {type(e).__name__} (Status: {getattr(e.response, 'status_code', 'N/A')}).")
                     return pd.DataFrame(columns=REQUIRED_COLUMNS)
                 
                 # Exponential backoff
@@ -157,12 +171,15 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
         soup = BeautifulSoup(response.content, 'html.parser')
         items = []
         
-        if platform_name == "Yahoo Auctions":
+        # Use the general product container wrapper:
+        product_container = soup.select_one('#productsContainer') 
+        
+        if product_container:
+            items = product_container.select('.product')
+        
+        # Fallback for Yahoo Auctions selector
+        if not items:
             items = soup.select('#yahoo-search-results .yahoo-search-result')
-        else:
-            items = soup.select('.product') 
-            if not items:
-                items = soup.select('.ag-item') or soup.select('.product-list-item')
 
         if not items: break
 
@@ -253,6 +270,15 @@ with st.sidebar:
 
     # 3. Scanner Properties
     st.header("⚙️ Properties")
+    
+    # Proxy Settings (NEW)
+    with st.expander("Network / Proxy"):
+        st.session_state['proxy_url'] = st.text_input(
+            "Proxy URL (Optional)", 
+            value=st.session_state['proxy_url'],
+            placeholder="http://user:pass@host:port",
+            help="Use a proxy to bypass 403 Forbidden errors on deployed apps."
+        )
     
     # AI Vision Status (Disabled/Under Development)
     st.subheader("🤖 AI Vision Status")
@@ -357,11 +383,18 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
         
         for platform_name, endpoint in active_platforms.items():
             progress_bar.progress(step_count / total_platforms, text=f"Scouting **{platform_name}** for **{query}**...")
+            
+            # Call the scraping function WITHOUT AI parameters
+            # The function definition must be updated to remove these params.
+            # However, since the function is internal, we pass dummy values to avoid changing the function signature, 
+            # and just ensure the function uses its internal logic (where AI is N/A)
+            
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
                 st.session_state['eur_to_jpy'], current_neg_keywords, scrape_depth,
-                current_sort_params, current_delay_range
+                current_sort_params, current_delay_range, st.session_state['proxy_url']
             )
+            
             if not df_results.empty:
                 all_results.append(df_results)
             step_count += 1
@@ -370,9 +403,6 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
 
     if all_results:
         final_df = pd.concat(all_results, ignore_index=True)
-        # Drop irrelevant columns from the final DF structure
-        final_df = final_df.drop(columns=['Landed Cost EUR (€)', 'Potential Profit (€)', 'Market Price EUR (€)'], errors='ignore')
-        
         st.session_state['results_df'] = final_df
         st.session_state['do_scrape'] = False 
     else:
