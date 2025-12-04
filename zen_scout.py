@@ -37,6 +37,20 @@ ZEN_LOGO_SVG = """
 # Fixed Exchange Rate (EUR to JPY) - Needs manual update periodically
 DEFAULT_EUR_TO_JPY_RATE = 181.0  
 
+# Hardcoded Proxy Pool for Testing
+# Format converted to: http://user:pass@ip:port
+PROXY_POOL = [
+    "http://xbzwvqqs:rsat3rwegkp5@142.111.48.253:7030",
+    "http://xbzwvqqs:rsat3rwegkp5@23.95.150.145:6114",
+    "http://xbzwvqqs:rsat3rwegkp5@198.23.239.134:6540",
+    "http://xbzwvqqs:rsat3rwegkp5@107.172.163.27:6543",
+    "http://xbzwvqqs:rsat3rwegkp5@198.105.121.200:6462",
+    "http://xbzwvqqs:rsat3rwegkp5@64.137.96.74:6641",
+    "http://xbzwvqqs:rsat3rwegkp5@84.247.60.125:6095",
+    "http://xbzwvqqs:rsat3rwegkp5@216.10.27.159:6837",
+    "http://xbzwvqqs:rsat3rwegkp5@142.111.67.146:5611"
+]
+
 DEFAULT_NEGATIVE_KEYWORDS = [
     "link", "komas", "belt", "strap", "buckle", "clasp", "bezel", 
     "glass", "crystal", "dial", "hands", "box", "manual", "parts", 
@@ -91,14 +105,12 @@ if 'request_delay' not in st.session_state:
     st.session_state['request_delay'] = (1.5, 3.0)
 if 'selected_platforms' not in st.session_state:
     st.session_state['selected_platforms'] = list(PLATFORM_ENDPOINTS.keys())
-if 'proxy_url' not in st.session_state:
-    st.session_state['proxy_url'] = ""
 
 # --- AI IS DEACTIVATED ---
 def get_ai_verdict(image_url: str, target_model: str, api_key: str) -> str:
     return "N/A (In Development)"
 
-def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple, proxy_url: str) -> pd.DataFrame:
+def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple) -> pd.DataFrame:
     """Fetches data from a specific ZenMarket platform with pagination and retry logic."""
     
     min_jpy_floor = min_eur_floor * eur_to_jpy_rate
@@ -123,17 +135,19 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
         response = None
         
         for attempt in range(max_retries):
+            # Pick a random proxy from the hardcoded pool
+            current_proxy = random.choice(PROXY_POOL)
+            
             scraper = cloudscraper.create_scraper(
                 browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
                 delay=random.uniform(delay_range[0], delay_range[1])
             )
             
-            # Configure Proxy if provided
-            if proxy_url:
-                scraper.proxies = {
-                    'http': proxy_url,
-                    'https': proxy_url,
-                }
+            # Configure Proxy
+            scraper.proxies = {
+                'http': current_proxy,
+                'https': current_proxy,
+            }
 
             # Rotate User Agent on retry
             scraper.headers.update({
@@ -271,14 +285,38 @@ with st.sidebar:
     # 3. Scanner Properties
     st.header("⚙️ Properties")
     
-    # Proxy Settings (NEW)
-    with st.expander("Network / Proxy"):
-        st.session_state['proxy_url'] = st.text_input(
-            "Proxy URL (Optional)", 
-            value=st.session_state['proxy_url'],
-            placeholder="http://user:pass@host:port",
-            help="Use a proxy to bypass 403 Forbidden errors on deployed apps."
+    # Config Persistence (New)
+    with st.expander("💾 Save/Load Targets"):
+        st.caption("Export or Import your target list.")
+        
+        # Convert current DF to CSV for download
+        csv_buffer = io.BytesIO()
+        st.session_state['target_df'].to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="Download Config (CSV)",
+            data=csv_buffer.getvalue(),
+            file_name="zen_targets.csv",
+            mime="text/csv",
+            use_container_width=True
         )
+        
+        # Upload CSV to update DF
+        uploaded_file = st.file_uploader("Upload Config (CSV)", type="csv")
+        if uploaded_file is not None:
+            try:
+                new_df = pd.read_csv(uploaded_file)
+                # Basic validation
+                required_cols = ["Model Name", "Search Query", "Min EUR Floor (€)", "Max EUR Ceiling (€)"]
+                if all(col in new_df.columns for col in required_cols):
+                    st.session_state['target_df'] = new_df
+                    st.success("Config loaded successfully!")
+                    # Rerun to refresh the data editor immediately
+                    st.rerun()
+                else:
+                    st.error(f"CSV missing columns. Needs: {required_cols}")
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+
     
     # AI Vision Status (Disabled/Under Development)
     st.subheader("🤖 AI Vision Status")
@@ -392,7 +430,7 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
                 st.session_state['eur_to_jpy'], current_neg_keywords, scrape_depth,
-                current_sort_params, current_delay_range, st.session_state['proxy_url']
+                current_sort_params, current_delay_range, "" # Empty proxy_url, since we hardcoded the pool
             )
             
             if not df_results.empty:
