@@ -430,7 +430,7 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
                 st.session_state['eur_to_jpy'], current_neg_keywords, scrape_depth,
-                current_sort_params, current_delay_range, "" # Empty proxy_url, since we hardcoded the pool
+                current_sort_params, current_delay_range
             )
             
             if not df_results.empty:
