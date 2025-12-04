@@ -5,6 +5,12 @@ import pandas as pd
 import time
 import random
 import io
+import requests # Needed to fetch image bytes for Gemini
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
 
 # --- 1. CONFIGURATION & ASSETS ---
 
@@ -52,7 +58,7 @@ PLATFORM_ENDPOINTS = {
 REQUIRED_COLUMNS = [
     "Platform", "Target Model", "Min EUR Floor (€)", "Min JPY Floor (Internal)",
     "Qualified", "Status/Reason", "Title", "Price JPY", "Price EUR (€)", "Image URL", "ZenMarket Link",
-    "Source Query"
+    "Source Query", "AI Verdict"
 ]
 
 # Mapping for Sort Options to ZenMarket URL Parameters
@@ -89,6 +95,10 @@ if 'request_delay' not in st.session_state:
     st.session_state['request_delay'] = (1.5, 3.0)
 if 'selected_platforms' not in st.session_state:
     st.session_state['selected_platforms'] = list(PLATFORM_ENDPOINTS.keys())
+if 'google_api_key' not in st.session_state:
+    st.session_state['google_api_key'] = ""
+if 'enable_ai' not in st.session_state:
+    st.session_state['enable_ai'] = False
 
 
 # --- 2. CORE SCRAPING AND FILTERING LOGIC ---
@@ -109,7 +119,44 @@ def is_qualified(title: str, price_jpy: float, min_jpy_floor: int, max_jpy_ceili
 
     return True, "Qualified by Text"
 
-def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple) -> pd.DataFrame:
+def get_ai_verdict(image_url: str, target_model: str, api_key: str) -> str:
+    """Uses Google Gemini 1.5 Flash to verify if the image matches the target model."""
+    if not api_key or not genai:
+        return "AI Skipped (No Key/Lib)"
+    
+    # Skip placeholders
+    if "placehold.co" in image_url:
+        return "No Image"
+
+    try:
+        # Fetch image bytes first (Gemini prefers inline data or uploaded files)
+        img_response = requests.get(image_url, timeout=10)
+        if img_response.status_code != 200:
+            return "Image Load Fail"
+        
+        image_bytes = img_response.content
+        
+        client = genai.Client(api_key=api_key)
+        
+        prompt = f"Is this image a {target_model}? Respond with 'YES' if it is clearly the correct watch model. Respond with 'NO' if it is a different watch, a box/accessory only, or completely unrelated. Respond with 'UNCERTAIN' if the image is too blurry or ambiguous."
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg" # Assuming JPEG, Gemini is forgiving
+                ),
+                prompt
+            ]
+        )
+        
+        return response.text.strip()
+        
+    except Exception as e:
+        return f"AI Error: {str(e)[:20]}"
+
+def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple, enable_ai: bool, api_key: str) -> pd.DataFrame:
     """Fetches data from a specific ZenMarket platform with pagination."""
     
     min_jpy_floor = min_eur_floor * eur_to_jpy_rate
@@ -133,14 +180,18 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
             if response.status_code != 200: break
                 
             soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # --- PLATFORM-SPECIFIC SELECTOR CHAIN ---
             items = []
             
-            if platform_name == "Yahoo Auctions":
+            # Use the general product container wrapper identified in the Mercari HTML:
+            product_container = soup.select_one('#productsContainer') 
+            
+            if product_container:
+                items = product_container.select('.product')
+            
+            if not items:
                 items = soup.select('#yahoo-search-results .yahoo-search-result')
-            else:
-                items = soup.select('.product') 
-                if not items:
-                    items = soup.select('.ag-item') or soup.select('.product-list-item')
 
             if not items: break
 
@@ -176,6 +227,13 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
                 
                 is_valid, status_reason = is_qualified(title, price_jpy, min_jpy_floor, max_jpy_ceiling, negative_keywords)
                 
+                ai_verdict = "N/A"
+                # Run AI Vision only on Qualified items to save cost
+                if enable_ai and is_valid:
+                    ai_verdict = get_ai_verdict(img_url, query, api_key)
+                    # Simple sleep to respect rate limits if looping AI fast
+                    time.sleep(0.5)
+                
                 all_results.append({
                     "Platform": platform_name,
                     "Target Model": query,
@@ -189,7 +247,8 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
                     "Price EUR (€)": price_eur, 
                     "Image URL": img_url,
                     "ZenMarket Link": link,
-                    "Source Query": query
+                    "Source Query": query,
+                    "AI Verdict": ai_verdict
                 })
                 page_results_count += 1
             
@@ -198,10 +257,7 @@ def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_f
         except Exception as e:
             break
             
-    return pd.DataFrame(all_results, columns=[
-        "Platform", "Target Model", "Min EUR Floor (€)", "Max EUR Ceiling (€)", "Min JPY Floor (Internal)", 
-        "Qualified", "Status/Reason", "Title", "Price JPY", "Price EUR (€)", "Image URL", "ZenMarket Link", "Source Query"
-    ])
+    return pd.DataFrame(all_results, columns=REQUIRED_COLUMNS)
 
 
 # --- 3. STREAMLIT UI & EXPORT ---
@@ -220,6 +276,16 @@ with st.sidebar:
     # 2. Scanner Properties
     st.header("⚙️ Properties")
     
+    # AI Vision Integration (Gemini)
+    st.subheader("🤖 AI Vision (Gemini)")
+    st.session_state['google_api_key'] = st.text_input("Google API Key", value=st.session_state['google_api_key'], type="password")
+    st.session_state['enable_ai'] = st.checkbox("Enable Vision (Slower)", value=st.session_state['enable_ai'], help="Analyze images of qualified listings using Gemini 1.5 Flash to confirm model match.")
+    
+    if st.session_state['enable_ai'] and not st.session_state['google_api_key']:
+        st.warning("⚠️ Google API Key required.")
+
+    st.divider()
+    
     # Scraping Depth
     scrape_depth = st.number_input(
         "Pages to Scrape", 
@@ -227,7 +293,7 @@ with st.sidebar:
         help="Number of pages to fetch per model. Higher depth takes longer."
     )
 
-    # Platform Selection (NEW)
+    # Platform Selection
     st.subheader("Platforms")
     st.session_state['selected_platforms'] = st.multiselect(
         "Select Markets:",
@@ -340,7 +406,8 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
                 st.session_state['eur_to_jpy'], current_neg_keywords, scrape_depth,
-                current_sort_params, current_delay_range
+                current_sort_params, current_delay_range,
+                st.session_state['enable_ai'], st.session_state['google_api_key']
             )
             if not df_results.empty:
                 all_results.append(df_results)
@@ -377,9 +444,11 @@ if not st.session_state['results_df'].empty:
     }
 
     with tab1:
+        # Ensure AI Verdict is displayed if present
+        display_cols = ["Platform", "Target Model", "Image URL", "Title", "Price JPY", "Price EUR (€)", "Min Floor (€)", "Max EUR Ceiling (€)", "ZenMarket Link", "AI Verdict"]
         st.dataframe(
             qualified_display,
-            column_order=["Platform", "Target Model", "Image URL", "Title", "Price JPY", "Price EUR (€)", "Min Floor (€)", "Max EUR Ceiling (€)", "ZenMarket Link"],
+            column_order=display_cols,
             column_config=qualified_column_config,
             hide_index=True,
             use_container_width=True
