@@ -5,14 +5,12 @@ import pandas as pd
 import time
 import random
 import io
-import requests # Needed to fetch image bytes for Gemini
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None
+import requests
+import numpy as np # Used for exponential backoff calculation
+# Removed Google GenAI import entirely as the functionality is now deprecated/disabled
+# No need to handle the try/except block for genai if we remove the logic.
 
-# --- 1. CONFIGURATION & ASSETS ---
+# --- 1. CONFIGURATION & CONSTANTS ---
 
 st.set_page_config(page_title="ZenArb", page_icon="⚡", layout="wide")
 
@@ -58,7 +56,7 @@ PLATFORM_ENDPOINTS = {
 REQUIRED_COLUMNS = [
     "Platform", "Target Model", "Min EUR Floor (€)", "Min JPY Floor (Internal)",
     "Qualified", "Status/Reason", "Title", "Price JPY", "Price EUR (€)", "Image URL", "ZenMarket Link",
-    "Source Query", "AI Verdict"
+    "Source Query" # AI Verdict column will be added dynamically when results are processed
 ]
 
 # Mapping for Sort Options to ZenMarket URL Parameters
@@ -95,169 +93,138 @@ if 'request_delay' not in st.session_state:
     st.session_state['request_delay'] = (1.5, 3.0)
 if 'selected_platforms' not in st.session_state:
     st.session_state['selected_platforms'] = list(PLATFORM_ENDPOINTS.keys())
-if 'google_api_key' not in st.session_state:
-    st.session_state['google_api_key'] = ""
-if 'enable_ai' not in st.session_state:
-    st.session_state['enable_ai'] = False
 
-
-# --- 2. CORE SCRAPING AND FILTERING LOGIC ---
-
-def is_qualified(title: str, price_jpy: float, min_jpy_floor: int, max_jpy_ceiling: int, negative_keywords: list) -> tuple[bool, str]:
-    """Applies textual and price floor/ceiling filters using JPY value."""
-    
-    if price_jpy < min_jpy_floor:
-        return False, f"Price too low (¥{int(price_jpy):,})"
-        
-    if max_jpy_ceiling > 0 and price_jpy > max_jpy_ceiling:
-        return False, f"Price too high (¥{int(price_jpy):,})"
-
-    title_lower = title.lower()
-    for word in negative_keywords:
-        if word.strip() and word.strip().lower() in title_lower:
-            return False, f"Detected keyword: '{word}'"
-
-    return True, "Qualified by Text"
-
+# --- AI IS DEACTIVATED ---
 def get_ai_verdict(image_url: str, target_model: str, api_key: str) -> str:
-    """Uses Google Gemini 1.5 Flash to verify if the image matches the target model."""
-    if not api_key or not genai:
-        return "AI Skipped (No Key/Lib)"
-    
-    # Skip placeholders
-    if "placehold.co" in image_url:
-        return "No Image"
+    return "N/A (In Development)"
 
-    try:
-        # Fetch image bytes first (Gemini prefers inline data or uploaded files)
-        img_response = requests.get(image_url, timeout=10)
-        if img_response.status_code != 200:
-            return "Image Load Fail"
-        
-        image_bytes = img_response.content
-        
-        client = genai.Client(api_key=api_key)
-        
-        prompt = f"Is this image a {target_model}? Respond with 'YES' if it is clearly the correct watch model. Respond with 'NO' if it is a different watch, a box/accessory only, or completely unrelated. Respond with 'UNCERTAIN' if the image is too blurry or ambiguous."
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg" # Assuming JPEG, Gemini is forgiving
-                ),
-                prompt
-            ]
-        )
-        
-        return response.text.strip()
-        
-    except Exception as e:
-        return f"AI Error: {str(e)[:20]}"
-
-def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple, enable_ai: bool, api_key: str) -> pd.DataFrame:
-    """Fetches data from a specific ZenMarket platform with pagination."""
+def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple) -> pd.DataFrame:
+    """Fetches data from a specific ZenMarket platform with pagination and retry logic."""
     
     min_jpy_floor = min_eur_floor * eur_to_jpy_rate
     max_jpy_ceiling = max_eur_ceiling * eur_to_jpy_rate
     
-    scraper = cloudscraper.create_scraper()
     base_url = f"https://zenmarket.jp/en/{endpoint}"
-    
     all_results = []
     
+    # User-Agent fallback list for retries (to increase stealth)
+    USER_AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; WOW64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    ]
+
     for page in range(1, max_pages + 1):
-        # Apply dynamic sort parameters here
         params = {'q': query, 'p': page}
-        params.update(sort_params) # Merge sort/order params
+        params.update(sort_params)
         
-        try:
-            # Use dynamic delay range
-            time.sleep(random.uniform(delay_range[0], delay_range[1]))
+        # --- RETRY LOOP FOR CONNECTION FAILURE (403/404/Timeout) ---
+        max_retries = 3
+        response = None
+        
+        for attempt in range(max_retries):
+            scraper = cloudscraper.create_scraper(
+                browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+                delay=random.uniform(delay_range[0], delay_range[1])
+            )
             
-            response = scraper.get(base_url, params=params)
-            if response.status_code != 200: break
+            # Rotate User Agent on retry
+            scraper.headers.update({'User-Agent': USER_AGENTS[attempt % len(USER_AGENTS)]})
+            
+            try:
+                # Add initial request delay
+                time.sleep(random.uniform(delay_range[0], delay_range[1]))
+                response = scraper.get(base_url, params=params)
+                response.raise_for_status()
                 
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # --- PLATFORM-SPECIFIC SELECTOR CHAIN ---
-            items = []
-            
-            # Use the general product container wrapper identified in the Mercari HTML:
-            product_container = soup.select_one('#productsContainer') 
-            
-            if product_container:
-                items = product_container.select('.product')
-            
-            if not items:
-                items = soup.select('#yahoo-search-results .yahoo-search-result')
+                # If successful, break the retry loop
+                break 
 
-            if not items: break
-
-            page_results_count = 0
-            
-            for item in items:
-                title_tag = item.select_one('.item-title') or \
-                            item.select_one('.translate a') or \
-                            item.select_one('h3')
-                            
-                if not title_tag: continue
-                title = title_tag.text.strip()
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    st.warning(f"Failed to fetch {platform_name} (Page {page}) after {max_retries} attempts: {type(e).__name__}.")
+                    return pd.DataFrame(columns=REQUIRED_COLUMNS)
                 
-                link_tag = item.select_one('a.product-item') or item.select_one('a')
-                link_href = link_tag['href'] if link_tag and 'href' in link_tag.attrs else ''
-                
-                if not link_href: continue
-                link = "https://zenmarket.jp/en/" + link_href if not link_href.startswith('http') else link_href
-                
-                img_tag = item.select_one('.img-wrap img')
-                img_url = img_tag['src'] if img_tag and 'src' in img_tag.attrs else "https://placehold.co/100x100/CCCCCC/000000?text=No+Image"
-
-                price_tag = item.select_one('.price .amount') or item.select_one('.auction-price .amount')
-                price_jpy = 0
-                price_eur = 0.0
-                
-                if price_tag and 'data-jpy' in price_tag.attrs:
-                    try:
-                        price_jpy = float(price_tag['data-jpy'].replace('¥','').replace(',',''))
-                        price_eur = round(price_jpy / eur_to_jpy_rate, 2)
-                    except:
-                        pass
-                
-                is_valid, status_reason = is_qualified(title, price_jpy, min_jpy_floor, max_jpy_ceiling, negative_keywords)
-                
-                ai_verdict = "N/A"
-                # Run AI Vision only on Qualified items to save cost
-                if enable_ai and is_valid:
-                    ai_verdict = get_ai_verdict(img_url, query, api_key)
-                    # Simple sleep to respect rate limits if looping AI fast
-                    time.sleep(0.5)
-                
-                all_results.append({
-                    "Platform": platform_name,
-                    "Target Model": query,
-                    "Min EUR Floor (€)": min_eur_floor,
-                    "Max EUR Ceiling (€)": max_eur_ceiling,
-                    "Min JPY Floor (Internal)": int(min_jpy_floor),
-                    "Qualified": is_valid,
-                    "Status/Reason": status_reason,
-                    "Title": title,
-                    "Price JPY": price_jpy,
-                    "Price EUR (€)": price_eur, 
-                    "Image URL": img_url,
-                    "ZenMarket Link": link,
-                    "Source Query": query,
-                    "AI Verdict": ai_verdict
-                })
-                page_results_count += 1
-            
-            if page_results_count < 5: break
-                
-        except Exception as e:
+                # Exponential backoff
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait_time)
+                continue
+        
+        if response is None:
             break
+
+        # --- PARSING ---
+        soup = BeautifulSoup(response.content, 'html.parser')
+        items = []
+        
+        if platform_name == "Yahoo Auctions":
+            items = soup.select('#yahoo-search-results .yahoo-search-result')
+        else:
+            items = soup.select('.product') 
+            if not items:
+                items = soup.select('.ag-item') or soup.select('.product-list-item')
+
+        if not items: break
+
+        page_results_count = 0
+        
+        for item in items:
+            title_tag = item.select_one('.item-title') or \
+                        item.select_one('.translate a') or \
+                        item.select_one('h3')
+                        
+            if not title_tag: continue
+            title = title_tag.text.strip()
             
-    return pd.DataFrame(all_results, columns=REQUIRED_COLUMNS)
+            link_tag = item.select_one('a.product-item') or item.select_one('a')
+            link_href = link_tag['href'] if link_tag and 'href' in link_tag.attrs else ''
+            
+            if not link_href: continue
+            link = "https://zenmarket.jp/en/" + link_href if not link_href.startswith('http') else link_href
+            
+            img_tag = item.select_one('.img-wrap img')
+            img_url = img_tag['src'] if img_tag and 'src' in img_tag.attrs else "https://placehold.co/100x100/CCCCCC/000000?text=No+Image"
+
+            price_tag = item.select_one('.price .amount') or item.select_one('.auction-price .amount')
+            price_jpy = 0
+            price_eur = 0.0
+            
+            if price_tag and 'data-jpy' in price_tag.attrs:
+                try:
+                    price_jpy = float(price_tag['data-jpy'].replace('¥','').replace(',',''))
+                    price_eur = round(price_jpy / eur_to_jpy_rate, 2)
+                except:
+                    pass
+            
+            is_valid, status_reason = is_qualified(title, price_jpy, min_jpy_floor, max_jpy_ceiling, negative_keywords)
+            
+            # AI is disabled, always N/A
+            ai_verdict = "N/A (In Development)"
+            
+            all_results.append({
+                "Platform": platform_name,
+                "Target Model": query,
+                "Min EUR Floor (€)": min_eur_floor,
+                "Max EUR Ceiling (€)": max_eur_ceiling,
+                "Min JPY Floor (Internal)": int(min_jpy_floor),
+                "Qualified": is_valid,
+                "Status/Reason": status_reason,
+                "Title": title,
+                "Price JPY": price_jpy,
+                "Price EUR (€)": price_eur, 
+                "Image URL": img_url,
+                "ZenMarket Link": link,
+                "Source Query": query,
+                "AI Verdict": ai_verdict # Always include verdict column
+            })
+            page_results_count += 1
+        
+        if page_results_count < 5: break
+            
+    return pd.DataFrame(all_results, columns=[
+        "Platform", "Target Model", "Min EUR Floor (€)", "Max EUR Ceiling (€)", "Min JPY Floor (Internal)", 
+        "Qualified", "Status/Reason", "Title", "Price JPY", "Price EUR (€)", "Image URL", "ZenMarket Link", "Source Query", "AI Verdict"
+    ])
 
 
 # --- 3. STREAMLIT UI & EXPORT ---
@@ -267,24 +234,29 @@ with st.sidebar:
     # 1. Logo & Description
     st.markdown(f"{ZEN_LOGO_SVG}", unsafe_allow_html=True)
     st.markdown("""
-    **Automated Arbitrage Scout**
-    
-    *Scan JDM marketplaces for undervalued watches.*
+    *Scout JDM market inefficiencies for undervalued watches.*
     """)
+    
+    # 2. Main Action (Moved to the top)
+    if st.button("🚀 Launch Scouting", type="primary", use_container_width=True):
+        if not st.session_state['target_df'].empty and all(st.session_state['target_df']['Search Query'].astype(str).str.len() > 0) and len(st.session_state['selected_platforms']) > 0:
+             st.session_state['do_scrape'] = True
+             st.session_state['results_df'] = pd.DataFrame() # Clear old results
+        else:
+            if len(st.session_state['selected_platforms']) == 0:
+                st.error("Please select at least one platform.")
+            else:
+                st.error("Please define valid search queries.")
+            st.session_state['do_scrape'] = False
+            
     st.divider()
 
-    # 2. Scanner Properties
+    # 3. Scanner Properties
     st.header("⚙️ Properties")
     
-    # AI Vision Integration (Gemini)
-    st.subheader("🤖 AI Vision (Gemini)")
-    st.session_state['google_api_key'] = st.text_input("Google API Key", value=st.session_state['google_api_key'], type="password")
-    st.session_state['enable_ai'] = st.checkbox("Enable Vision (Slower)", value=st.session_state['enable_ai'], help="Analyze images of qualified listings using Gemini 1.5 Flash to confirm model match.")
-    
-    if st.session_state['enable_ai'] and not st.session_state['google_api_key']:
-        st.warning("⚠️ Google API Key required.")
-
-    st.divider()
+    # AI Vision Status (Disabled/Under Development)
+    st.subheader("🤖 AI Vision Status")
+    st.info("The image analysis feature is currently N/A (In Development).")
     
     # Scraping Depth
     scrape_depth = st.number_input(
@@ -332,22 +304,6 @@ with st.sidebar:
         )
     
     st.divider()
-    
-    # 3. Main Action
-    if st.button("🚀 Launch Scouting", type="primary", use_container_width=True):
-        # Validation: Check target list and platform selection
-        if not st.session_state['target_df'].empty and \
-           all(st.session_state['target_df']['Search Query'].astype(str).str.len() > 0) and \
-           len(st.session_state['selected_platforms']) > 0:
-             
-             st.session_state['do_scrape'] = True
-             st.session_state['results_df'] = pd.DataFrame()
-        else:
-            if len(st.session_state['selected_platforms']) == 0:
-                st.error("Please select at least one platform.")
-            else:
-                st.error("Please define valid search queries.")
-            st.session_state['do_scrape'] = False
 
 
 # --- MAIN AREA: TARGETS ---
@@ -385,11 +341,9 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
     all_results = []
     current_neg_keywords = [k.strip().lower() for k in st.session_state['neg_keywords_str'].split('\n') if k.strip()]
     
-    # Get selected sort params
     current_sort_params = SORT_STRATEGIES[st.session_state['sort_strategy']]
     current_delay_range = st.session_state['request_delay']
     
-    # Filter platforms based on selection
     active_platforms = {k: v for k, v in PLATFORM_ENDPOINTS.items() if k in st.session_state['selected_platforms']}
     
     total_platforms = len(active_platforms) * len(st.session_state['target_df'])
@@ -406,8 +360,7 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
                 st.session_state['eur_to_jpy'], current_neg_keywords, scrape_depth,
-                current_sort_params, current_delay_range,
-                st.session_state['enable_ai'], st.session_state['google_api_key']
+                current_sort_params, current_delay_range
             )
             if not df_results.empty:
                 all_results.append(df_results)
@@ -417,6 +370,9 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
 
     if all_results:
         final_df = pd.concat(all_results, ignore_index=True)
+        # Drop irrelevant columns from the final DF structure
+        final_df = final_df.drop(columns=['Landed Cost EUR (€)', 'Potential Profit (€)', 'Market Price EUR (€)'], errors='ignore')
+        
         st.session_state['results_df'] = final_df
         st.session_state['do_scrape'] = False 
     else:
@@ -427,6 +383,11 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
 # --- RESULTS DISPLAY ---
 if not st.session_state['results_df'].empty:
     df_display = st.session_state['results_df']
+    
+    # Filter out the AI Verdict column for display/export purposes
+    if 'AI Verdict' in df_display.columns:
+        df_display = df_display.drop(columns=['AI Verdict'], errors='ignore')
+    
     qualified_df = df_display[df_display['Qualified'] == True].copy()
     rejected_df = df_display[df_display['Qualified'] == False].copy()
     
@@ -444,11 +405,9 @@ if not st.session_state['results_df'].empty:
     }
 
     with tab1:
-        # Ensure AI Verdict is displayed if present
-        display_cols = ["Platform", "Target Model", "Image URL", "Title", "Price JPY", "Price EUR (€)", "Min Floor (€)", "Max EUR Ceiling (€)", "ZenMarket Link", "AI Verdict"]
         st.dataframe(
             qualified_display,
-            column_order=display_cols,
+            column_order=["Platform", "Target Model", "Image URL", "Title", "Price JPY", "Price EUR (€)", "Min Floor (€)", "Max EUR Ceiling (€)", "ZenMarket Link"],
             column_config=qualified_column_config,
             hide_index=True,
             use_container_width=True
@@ -467,9 +426,13 @@ if not st.session_state['results_df'].empty:
     def to_excel(df: pd.DataFrame) -> bytes:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            q_export = df[df['Qualified'] == True].drop(columns=['Qualified', 'Source Query', 'Min JPY Floor (Internal)'])
+            # Drop AI Verdict from the output for export cleanliness
+            df_cleaned = df.drop(columns=['AI Verdict'], errors='ignore') 
+            
+            q_export = df_cleaned[df_cleaned['Qualified'] == True].drop(columns=['Qualified', 'Source Query', 'Min JPY Floor (Internal)'])
             q_export.to_excel(writer, sheet_name='Qualified Listings', index=False)
-            r_export = df[df['Qualified'] == False].drop(columns=['Qualified', 'Source Query', 'Min JPY Floor (Internal)', 'Image URL'])
+            
+            r_export = df_cleaned[df_cleaned['Qualified'] == False].drop(columns=['Qualified', 'Source Query', 'Min JPY Floor (Internal)', 'Image URL'])
             r_export.to_excel(writer, sheet_name='Rejected Candidates', index=False)
         return output.getvalue()
 
