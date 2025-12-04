@@ -110,11 +110,31 @@ if 'selected_platforms' not in st.session_state:
 def get_ai_verdict(image_url: str, target_model: str, api_key: str) -> str:
     return "N/A (In Development)"
 
+def is_qualified(title: str, price_jpy: float, min_jpy_floor: int, max_jpy_ceiling: int, negative_keywords: list) -> tuple[bool, str]:
+    """Applies textual and price floor/ceiling filters using JPY value."""
+    
+    if price_jpy < min_jpy_floor:
+        return False, f"Price too low (¥{int(price_jpy):,})"
+        
+    if max_jpy_ceiling > 0 and price_jpy > max_jpy_ceiling:
+        return False, f"Price too high (¥{int(price_jpy):,})"
+
+    title_lower = title.lower()
+    for word in negative_keywords:
+        if word.strip() and word.strip().lower() in title_lower:
+            return False, f"Detected keyword: '{word}'"
+
+    return True, "Qualified by Text"
+
 def run_platform_scrape(platform_name: str, endpoint: str, query: str, min_eur_floor: float, max_eur_ceiling: float, eur_to_jpy_rate: float, negative_keywords: list, max_pages: int, sort_params: dict, delay_range: tuple) -> pd.DataFrame:
     """Fetches data from a specific ZenMarket platform with pagination and retry logic."""
     
-    min_jpy_floor = min_eur_floor * eur_to_jpy_rate
-    max_jpy_ceiling = max_eur_ceiling * eur_to_jpy_rate
+    # Ensure ceilings are safe numbers (handle None/NaN)
+    safe_max_eur = max_eur_ceiling if pd.notnull(max_eur_ceiling) else 0.0
+    safe_min_eur = min_eur_floor if pd.notnull(min_eur_floor) else 0.0
+
+    min_jpy_floor = safe_min_eur * eur_to_jpy_rate
+    max_jpy_ceiling = safe_max_eur * eur_to_jpy_rate
     
     base_url = f"https://zenmarket.jp/en/{endpoint}"
     all_results = []
@@ -416,16 +436,16 @@ if 'do_scrape' in st.session_state and st.session_state['do_scrape']:
     
     for index, scout_data in st.session_state['target_df'].iterrows():
         query = scout_data.get("Search Query")
+        
+        # Robust getter with fallback to 0.0 if missing/None
         min_eur_floor = scout_data.get("Min EUR Floor (€)")
+        if pd.isna(min_eur_floor): min_eur_floor = 0.0
+        
         max_eur_ceiling = scout_data.get("Max EUR Ceiling (€)") 
+        if pd.isna(max_eur_ceiling): max_eur_ceiling = 0.0
         
         for platform_name, endpoint in active_platforms.items():
             progress_bar.progress(step_count / total_platforms, text=f"Scouting **{platform_name}** for **{query}**...")
-            
-            # Call the scraping function WITHOUT AI parameters
-            # The function definition must be updated to remove these params.
-            # However, since the function is internal, we pass dummy values to avoid changing the function signature, 
-            # and just ensure the function uses its internal logic (where AI is N/A)
             
             df_results = run_platform_scrape(
                 platform_name, endpoint, query, min_eur_floor, max_eur_ceiling,
